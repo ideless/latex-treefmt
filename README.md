@@ -106,6 +106,23 @@ Pass `--no-item-line-breaks` to preserve existing line breaks around `\item`
 declarations instead of applying the default `ItemStartsOnOwnLine: 1` and
 `ItemFinishesWithLineBreak: 1` behavior.
 
+### Skip a region
+
+Put these comments on their own lines to leave a region exactly as written:
+
+```tex
+This sentence. Gets formatted.
+% latex-treefmt: off
+  $ x  + y $   % spacing kept
+% latex-treefmt: on
+This sentence. Gets formatted too.
+```
+
+The directive lines are preserved as well. Leading and trailing spaces on those
+lines are allowed. If an `off` directive has no matching `on` directive, the
+rest of the file is left unchanged. Directives inside verbatim-like environments
+or at the end of another line are treated as ordinary text.
+
 ## Use it in Neovim
 
 Install the formatter with `cargo install --path .` and register it as a

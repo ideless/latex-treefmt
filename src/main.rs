@@ -159,6 +159,7 @@ fn print_help() {
         "latex-treefmt [OPTIONS] [FILE]\n\
          \n\
          Reads FILE, or stdin when FILE is omitted or '-'. Writes formatted LaTeX to stdout.\n\
+         Use full-line % latex-treefmt: off / on comments to preserve a region.\n\
          \n\
          Options:\n\
            --preserve                  Reconstruct the source byte-for-byte\n\

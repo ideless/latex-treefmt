@@ -627,6 +627,7 @@ fn apply_tree_formatting(
     metadata: &TreeMetadata,
 ) -> Result<String, WriteError> {
     let mut edits = Vec::new();
+    let skipped = SkipRegions::new(source);
 
     if options.compact_math {
         let bytes = source.as_bytes();
@@ -643,7 +644,8 @@ fn apply_tree_formatting(
                     offset += 1;
                 }
                 let range = start..offset;
-                if overlaps_any(&range, &metadata.protected_math_ranges) {
+                if overlaps_any(&range, &metadata.protected_math_ranges) || skipped.overlaps(&range)
+                {
                     continue;
                 }
 
@@ -661,6 +663,9 @@ fn apply_tree_formatting(
 
     if options.simplify_math_scripts {
         for group in &metadata.simple_script_groups {
+            if skipped.overlaps(group) {
+                continue;
+            }
             edits.push(TextEdit {
                 range: group.start..group.start + 1,
                 replacement: "",
@@ -673,6 +678,9 @@ fn apply_tree_formatting(
     }
 
     for formula in &metadata.formula_delimiters {
+        if skipped.overlaps(&formula.opening) || skipped.overlaps(&formula.closing) {
+            continue;
+        }
         let replacements = match formula.kind {
             FormulaKind::Inline => match options.inline_math_delimiters {
                 InlineMathDelimiters::Preserve => None,
@@ -729,6 +737,8 @@ fn apply_item_line_breaks(source: &str, tree: &Tree, options: &WriterOptions) ->
 
     let mut breaks = Vec::new();
     collect_item_line_breaks(tree.root_node(), source, options, &mut breaks);
+    let skipped = SkipRegions::new(source);
+    breaks.retain(|offset| !skipped.contains_offset(*offset));
     breaks.sort_unstable();
     breaks.dedup();
 
@@ -792,10 +802,14 @@ fn apply_display_math_layout(
 
     let mut formulas = Vec::new();
     collect_display_formulas(tree.root_node(), &mut formulas);
+    let skipped = SkipRegions::new(source);
     let line_ending = detected_line_ending(source);
     let mut edits = Vec::new();
 
     for formula in formulas {
+        if skipped.overlaps(&formula.range) {
+            continue;
+        }
         if options.display_math_layout == DisplayMathLayout::Adaptive && formula.single_line {
             continue;
         }
@@ -946,6 +960,7 @@ fn align_environment_rows(
             ending: line.ending.to_owned(),
         })
         .collect::<Vec<_>>();
+    let skipped = SkipRegions::new(source);
 
     for (block_index, block) in metadata.alignment_blocks.iter().enumerate() {
         let mut rows = block
@@ -963,6 +978,7 @@ fn align_environment_rows(
                             && other.contains(row)
                     })
             })
+            .filter(|row| !skipped.contains_row(*row))
             .filter_map(|row| {
                 lines
                     .get(row)
@@ -1174,10 +1190,17 @@ fn brace_depth_at(text: &str, end: usize) -> usize {
 
 fn rewrite_lines(source: &str, options: &WriterOptions, metadata: &TreeMetadata) -> String {
     let fallback_ending = detected_line_ending(source);
+    let skipped = SkipRegions::new(source);
     let mut output = String::with_capacity(source.len());
     let mut blank_lines = 0;
 
     for (row, line) in SourceLines::new(source).enumerate() {
+        if skipped.contains_row(row) {
+            output.push_str(line.content);
+            output.push_str(line.ending);
+            blank_lines = 0;
+            continue;
+        }
         let raw_content = metadata.raw_content.get(row).copied().unwrap_or(false);
         let contains_comment = metadata.contains_comment.get(row).copied().unwrap_or(false);
         let mut content = line.content;
@@ -1217,7 +1240,11 @@ fn rewrite_lines(source: &str, options: &WriterOptions, metadata: &TreeMetadata)
         }
     }
 
-    if options.ensure_final_newline && !output.is_empty() && !output.ends_with('\n') {
+    if options.ensure_final_newline
+        && !skipped.rows.last().copied().unwrap_or(false)
+        && !output.is_empty()
+        && !output.ends_with('\n')
+    {
         output.push_str(match options.line_ending {
             LineEnding::Preserve => fallback_ending,
             LineEnding::Lf => "\n",
@@ -1234,9 +1261,15 @@ fn separate_math_environment_boundaries(source: &str, options: &WriterOptions) -
     }
 
     let fallback_ending = detected_line_ending(source);
+    let skipped = SkipRegions::new(source);
     let mut output = String::with_capacity(source.len());
 
-    for line in SourceLines::new(source) {
+    for (row, line) in SourceLines::new(source).enumerate() {
+        if skipped.contains_row(row) {
+            output.push_str(line.content);
+            output.push_str(line.ending);
+            continue;
+        }
         let leading_len = line.content.len() - line.content.trim_start_matches([' ', '\t']).len();
         let leading = &line.content[..leading_len];
         let trimmed = &line.content[leading_len..];
@@ -1379,12 +1412,28 @@ fn rewrite_prose(source: &str, options: &WriterOptions) -> String {
     }
 
     let fallback_ending = detected_line_ending(source);
+    let skipped = SkipRegions::new(source);
     let mut output = String::with_capacity(source.len());
     let mut previous_blank = true;
     let mut previous_section = false;
     let mut raw_environment: Option<String> = None;
 
-    for line in SourceLines::new(source) {
+    for (row, line) in SourceLines::new(source).enumerate() {
+        if skipped.contains_row(row) {
+            output.push_str(line.content);
+            output.push_str(line.ending);
+            previous_blank = false;
+            previous_section = false;
+            if let Some(name) = raw_environment_name(line.content, "begin") {
+                raw_environment = Some(name.to_owned());
+            }
+            if let Some(name) = raw_environment.as_deref()
+                && raw_environment_name(line.content, "end") == Some(name)
+            {
+                raw_environment = None;
+            }
+            continue;
+        }
         let blank = line.content.trim_matches([' ', '\t']).is_empty();
         let entering_raw = raw_environment_name(line.content, "begin");
         let raw_content = raw_environment.is_some() || entering_raw.is_some();
@@ -1617,6 +1666,71 @@ struct SourceLines<'source> {
     offset: usize,
 }
 
+/// Full-line comment directives protect their own lines and the lines between them.
+struct SkipRegions {
+    ranges: Vec<Range<usize>>,
+    rows: Vec<bool>,
+}
+
+impl SkipRegions {
+    fn new(source: &str) -> Self {
+        let mut ranges = Vec::new();
+        let mut rows = Vec::new();
+        let mut active: Option<(usize, usize)> = None;
+        let mut raw_environment: Option<String> = None;
+        let mut offset = 0;
+
+        for (row, line) in SourceLines::new(source).enumerate() {
+            rows.push(false);
+            let directive = line.content.trim_matches([' ', '\t']);
+            let end = offset + line.content.len() + line.ending.len();
+            let entering_raw = raw_environment_name(line.content, "begin");
+            let is_comment_directive = raw_environment.is_none() && entering_raw.is_none();
+
+            if let Some((start, first_row)) = active {
+                if is_comment_directive && directive == "% latex-treefmt: on" {
+                    ranges.push(start..end);
+                    rows[first_row..=row].fill(true);
+                    active = None;
+                }
+            } else if is_comment_directive && directive == "% latex-treefmt: off" {
+                active = Some((offset, row));
+            }
+
+            if let Some(name) = raw_environment.as_deref()
+                && raw_environment_name(line.content, "end") == Some(name)
+            {
+                raw_environment = None;
+            } else if raw_environment.is_none()
+                && let Some(name) = entering_raw
+            {
+                raw_environment = Some(name.to_owned());
+            }
+
+            offset = end;
+        }
+
+        if let Some((start, first_row)) = active {
+            ranges.push(start..source.len());
+            rows[first_row..].fill(true);
+        }
+
+        Self { ranges, rows }
+    }
+
+    fn contains_row(&self, row: usize) -> bool {
+        self.rows.get(row).copied().unwrap_or(false)
+    }
+
+    fn contains_offset(&self, offset: usize) -> bool {
+        self.ranges.iter().any(|range| range.contains(&offset))
+    }
+
+    fn overlaps(&self, range: &Range<usize>) -> bool {
+        overlaps_any(range, &self.ranges)
+    }
+}
+
 impl<'source> SourceLines<'source> {
     fn new(source: &'source str) -> Self {
         Self { source, offset: 0 }
@@ -1834,6 +1948,139 @@ mod tests {
     fn retains_comment_contents() {
         let source = "% trailing spaces are comment text   \ntext   \n";
         let expected = "% trailing spaces are comment text   \ntext\n";
+
+        assert_eq!(write(source, &WriterOptions::default()), expected);
+    }
+
+    #[test]
+    fn skips_formatting_between_comment_directives() {
+        let source = concat!(
+            "\\begin{document}\n",
+            " before. After.   \n",
+            "  % latex-treefmt: off  \r\n",
+            "  $ x  + y $   \r\n",
+            "\r\n",
+            "  \\section{Untouched}   \r\n",
+            "  % latex-treefmt: on  \r\n",
+            " after. Again.   \n",
+            "\\end{document}\n"
+        );
+        let expected = concat!(
+            "\\begin{document}\n",
+            "before.\n",
+            "After.\n",
+            "  % latex-treefmt: off  \r\n",
+            "  $ x  + y $   \r\n",
+            "\r\n",
+            "  \\section{Untouched}   \r\n",
+            "  % latex-treefmt: on  \r\n",
+            "after.\n",
+            "Again.\n",
+            "\\end{document}\n"
+        );
+
+        assert_eq!(write(source, &WriterOptions::default()), expected);
+        assert_eq!(write(expected, &WriterOptions::default()), expected);
+    }
+
+    #[test]
+    fn skips_alignment_and_item_rewrites_inside_directives() {
+        let source = concat!(
+            "\\begin{align*}\n",
+            "a &= x \\\\\n",
+            "% latex-treefmt: off\n",
+            "  long &= x + y   \\\\  \n",
+            "% latex-treefmt: on\n",
+            "b &= z \\\\\n",
+            "\\end{align*}\n",
+            "\\begin{enumerate}\n",
+            "% latex-treefmt: off\n",
+            "\\item First item. Second item.\n",
+            "% latex-treefmt: on\n",
+            "\\item Third item.\n",
+            "\\end{enumerate}\n"
+        );
+        let output = write(source, &WriterOptions::default());
+
+        assert!(output.contains("  long &= x + y   \\\\  \n"));
+        assert!(output.contains("\\item First item. Second item.\n"));
+        assert!(output.contains("  \\item\n    Third item.\n"));
+        assert_eq!(write(&output, &WriterOptions::default()), output);
+    }
+
+    #[test]
+    fn skips_to_end_of_file_without_an_on_directive() {
+        let source = "before. After.\n% latex-treefmt: off\r\n  $ x + y $   ";
+        let expected = "before.\nAfter.\n% latex-treefmt: off\r\n  $ x + y $   ";
+
+        assert_eq!(write(source, &WriterOptions::default()), expected);
+    }
+
+    #[test]
+    fn skipped_lines_keep_their_line_endings_when_conversion_is_requested() {
+        let source = "before\n% latex-treefmt: off\n  literal   \n% latex-treefmt: on\nafter\n";
+        let options = WriterOptions {
+            line_ending: LineEnding::Crlf,
+            ..WriterOptions::default()
+        };
+        let expected =
+            "before\r\n% latex-treefmt: off\n  literal   \n% latex-treefmt: on\nafter\r\n";
+
+        assert_eq!(write(source, &options), expected);
+    }
+
+    #[test]
+    fn preserves_multiple_regions_and_display_math_layout() {
+        let source = concat!(
+            "% latex-treefmt: off\n",
+            "\\[ x + y \\]\n",
+            "% latex-treefmt: on\n",
+            "Between. Sentences.\n",
+            "% latex-treefmt: off\n",
+            "\\begin{equation} a + b \\end{equation}\n",
+            "% latex-treefmt: on"
+        );
+        let expected = concat!(
+            "% latex-treefmt: off\n",
+            "\\[ x + y \\]\n",
+            "% latex-treefmt: on\n",
+            "Between.\n",
+            "Sentences.\n",
+            "% latex-treefmt: off\n",
+            "\\begin{equation} a + b \\end{equation}\n",
+            "% latex-treefmt: on"
+        );
+
+        assert_eq!(write(source, &WriterOptions::default()), expected);
+    }
+
+    #[test]
+    fn ignores_directive_text_in_verbatim_and_inline_comments() {
+        let source = concat!(
+            "\\begin{verbatim}\n",
+            "% latex-treefmt: off\n",
+            "\\end{verbatim}\n",
+            "before. After. % latex-treefmt: off\n",
+            "following. Sentence.\n"
+        );
+        let output = write(source, &WriterOptions::default());
+
+        assert!(output.contains("before.\nAfter. % latex-treefmt: off\n"));
+        assert!(output.contains("following.\nSentence.\n"));
+    }
+
+    #[test]
+    fn ignores_on_directive_inside_verbatim_within_skipped_region() {
+        let source = concat!(
+            "% latex-treefmt: off\n",
+            "\\begin{verbatim}\n",
+            "% latex-treefmt: on\n",
+            "\\end{verbatim}\n",
+            "  $ x + y $   \n",
+            "% latex-treefmt: on\n",
+            "After. Another.\n"
+        );
+        let expected = source.replace("After. Another.\n", "After.\nAnother.\n");
 
         assert_eq!(write(source, &WriterOptions::default()), expected);
     }
