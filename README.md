@@ -106,6 +106,29 @@ Pass `--no-item-line-breaks` to preserve existing line breaks around `\item`
 declarations instead of applying the default `ItemStartsOnOwnLine: 1` and
 `ItemFinishesWithLineBreak: 1` behavior.
 
+## Use it in Neovim
+
+Install the formatter with `cargo install --path .` and register it as a
+stdin/stdout formatting source. For `none-ls.nvim`, add this to your `sources`
+list:
+
+```lua
+{
+  name = "latex-treefmt",
+  method = null_ls.methods.FORMATTING,
+  filetypes = { "tex" },
+  generator = null_ls.formatter({
+    command = "latex-treefmt",
+    to_stdin = true,
+  }),
+},
+```
+
+Run `cargo install --path . --force` after rebuilding this project so Neovim
+uses the latest binary. Make sure Cargo's bin directory is on Neovim's `PATH`.
+Use `:echo executable('latex-treefmt')` to check that Neovim can find it, then
+`:NullLsInfo` to confirm that it is registered for a TeX buffer.
+
 ## Parser dependency
 
 The grammar repository is pinned to upstream v0.6.0 as the
