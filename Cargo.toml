@@ -1,0 +1,13 @@
+[package]
+name = "latex-treefmt"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "A configurable, syntax-tree-based LaTeX formatter"
+
+[dependencies]
+tree-sitter = "0.24.7"
+tree-sitter-latex = { path = "vendor/tree-sitter-latex" }
+
+[lints.rust]
+unsafe_code = "forbid"

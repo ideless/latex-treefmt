@@ -1,0 +1,3 @@
+vendor/tree-sitter-latex/src/parser.c linguist-generated=true
+vendor/tree-sitter-latex/src/grammar.json linguist-generated=true
+vendor/tree-sitter-latex/src/node-types.json linguist-generated=true
