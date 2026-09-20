@@ -544,7 +544,7 @@ fn merge_ranges(ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
 }
 
 fn is_simple_script_group(source: &str, range: Range<usize>) -> bool {
-    let Some(group) = source.get(range) else {
+    let Some(group) = source.get(range.clone()) else {
         return false;
     };
     let Some(inner) = group
@@ -562,11 +562,22 @@ fn is_simple_script_group(source: &str, range: Range<usize>) -> bool {
     let Some(command) = inner.strip_prefix('\\') else {
         return false;
     };
-    !command.is_empty()
-        && (command
+    if command.is_empty() {
+        return false;
+    }
+
+    if command
+        .chars()
+        .all(|character| character.is_alphabetic() || character == '@')
+    {
+        let next = source[range.end..]
+            .trim_start_matches([' ', '\t'])
             .chars()
-            .all(|character| character.is_alphabetic() || character == '@')
-            || command.chars().count() == 1)
+            .next();
+        return !next.is_some_and(|character| character.is_alphabetic() || character == '@');
+    }
+
+    command.chars().count() == 1
 }
 
 fn is_textual_math_command(source: &str, node: Node<'_>) -> bool {
@@ -1841,6 +1852,15 @@ mod tests {
         );
 
         assert_eq!(write(source, &WriterOptions::default()), expected);
+    }
+
+    #[test]
+    fn keeps_script_braces_when_a_control_word_precedes_a_letter() {
+        let source = "$T^{\\top}x+A_{\\alpha} y+B^{\\top}+C$\n";
+        let expected = "$T^{\\top}x+A_{\\alpha}y+B^\\top+C$\n";
+
+        assert_eq!(write(source, &WriterOptions::default()), expected);
+        assert_eq!(write(expected, &WriterOptions::default()), expected);
     }
 
     #[test]
