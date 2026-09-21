@@ -51,6 +51,7 @@ fn parse_args() -> Result<(Option<String>, WriterOptions), String> {
             "--keep-math-whitespace" => options.compact_math = false,
             "--keep-script-braces" => options.simplify_math_scripts = false,
             "--no-sentence-wrap" => options.sentence_per_line = false,
+            "--keep-prose-whitespace" => options.collapse_prose_whitespace = false,
             "--no-section-blank-lines" => options.blank_lines_around_sections = false,
             "--allow-inline-math-environments" => {
                 options.separate_math_environment_boundaries = false;
@@ -173,6 +174,7 @@ fn print_help() {
            --keep-math-whitespace      Keep horizontal whitespace inside math\n\
            --keep-script-braces        Keep braces around single-token scripts\n\
            --no-sentence-wrap          Do not put prose sentences on separate lines\n\
+           --keep-prose-whitespace     Keep repeated spaces and tabs in prose\n\
            --no-section-blank-lines    Do not add blank lines around sections\n\
            --allow-inline-math-environments\n\
                                        Do not isolate math-environment boundaries\n\

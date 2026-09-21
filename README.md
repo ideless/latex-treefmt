@@ -37,6 +37,7 @@ The current writer formats:
 - redundant braces around single-token subscripts and superscripts;
 - recognized math-environment boundaries adjacent to prose;
 - one prose sentence per source line;
+- repeated spaces and tabs in prose collapsed to one space;
 - blank lines around sectioning commands;
 - trailing whitespace, repeated blank lines, line endings, and the final newline.
 
@@ -105,6 +106,8 @@ separators and `\\` row terminators.
 Pass `--no-item-line-breaks` to preserve existing line breaks around `\item`
 declarations instead of applying the default `ItemStartsOnOwnLine: 1` and
 `ItemFinishesWithLineBreak: 1` behavior.
+
+Pass `--keep-prose-whitespace` to retain repeated spaces and tabs in prose.
 
 ### Skip a region
 

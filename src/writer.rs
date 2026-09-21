@@ -77,6 +77,8 @@ pub struct WriterOptions {
     pub simplify_math_scripts: bool,
     /// Put each prose sentence on its own source line.
     pub sentence_per_line: bool,
+    /// Collapse repeated horizontal whitespace in prose to one space.
+    pub collapse_prose_whitespace: bool,
     /// Ensure a blank line before and after sectioning commands.
     pub blank_lines_around_sections: bool,
     /// Keep recognized math-environment boundaries on their own lines.
@@ -108,6 +110,7 @@ impl Default for WriterOptions {
             compact_math: true,
             simplify_math_scripts: true,
             sentence_per_line: true,
+            collapse_prose_whitespace: true,
             blank_lines_around_sections: true,
             separate_math_environment_boundaries: true,
             align_environment_rows: true,
@@ -134,6 +137,7 @@ impl WriterOptions {
             compact_math: false,
             simplify_math_scripts: false,
             sentence_per_line: false,
+            collapse_prose_whitespace: false,
             blank_lines_around_sections: false,
             separate_math_environment_boundaries: false,
             align_environment_rows: false,
@@ -183,8 +187,15 @@ impl<'source, 'options> LatexWriter<'source, 'options> {
         let display_formatted =
             apply_display_math_layout(&item_formatted, &item_tree, self.options)?;
         let display_tree = parser.parse(&display_formatted)?;
-        let metadata = TreeMetadata::from_tree(&display_tree, &display_formatted, self.options);
-        let aligned = align_environment_rows(&display_formatted, self.options, &metadata);
+        let environment_formatted = normalize_generic_environment_boundaries(
+            &display_formatted,
+            &display_tree,
+            self.options,
+        )?;
+        let environment_tree = parser.parse(&environment_formatted)?;
+        let metadata =
+            TreeMetadata::from_tree(&environment_tree, &environment_formatted, self.options);
+        let aligned = align_environment_rows(&environment_formatted, self.options, &metadata);
         let line_formatted = rewrite_lines(&aligned, self.options, &metadata);
         let block_formatted = separate_math_environment_boundaries(&line_formatted, self.options);
         Ok(rewrite_prose(&block_formatted, self.options))
@@ -725,7 +736,7 @@ fn apply_tree_formatting(
 }
 
 #[derive(Debug)]
-struct DisplayMathEdit {
+struct OwnedTextEdit {
     range: Range<usize>,
     replacement: String,
 }
@@ -856,7 +867,7 @@ fn apply_display_math_layout(
         if suffix_has_content {
             replacement.push_str(line_ending);
         }
-        edits.push(DisplayMathEdit { range, replacement });
+        edits.push(OwnedTextEdit { range, replacement });
     }
 
     edits.sort_by_key(|edit| edit.range.start);
@@ -893,6 +904,142 @@ fn collect_display_formulas(node: Node<'_>, formulas: &mut Vec<DisplayFormula>) 
     for child in node.children(&mut cursor) {
         collect_display_formulas(child, formulas);
     }
+}
+
+fn normalize_generic_environment_boundaries(
+    source: &str,
+    tree: &Tree,
+    options: &WriterOptions,
+) -> Result<String, WriteError> {
+    let skipped = SkipRegions::new(source);
+    let mut edits = Vec::new();
+    collect_generic_environment_edits(
+        tree.root_node(),
+        source,
+        detected_line_ending(source),
+        options,
+        &skipped,
+        &mut edits,
+    );
+    edits.sort_by_key(|edit| edit.range.start);
+    if edits
+        .windows(2)
+        .any(|pair| pair[0].range.end > pair[1].range.start)
+    {
+        return Err(WriteError::OverlappingEdits);
+    }
+
+    let mut output = source.to_owned();
+    for edit in edits.into_iter().rev() {
+        output.replace_range(edit.range, &edit.replacement);
+    }
+    Ok(output)
+}
+
+fn collect_generic_environment_edits(
+    node: Node<'_>,
+    source: &str,
+    line_ending: &str,
+    options: &WriterOptions,
+    skipped: &SkipRegions,
+    edits: &mut Vec<OwnedTextEdit>,
+) {
+    if node.kind() == "generic_environment"
+        && let (Some(begin), Some(end)) = (
+            node.child_by_field_name("begin"),
+            node.child_by_field_name("end"),
+        )
+        && !skipped.overlaps(&begin.byte_range())
+        && !skipped.overlaps(&end.byte_range())
+        && source
+            .get(begin.byte_range())
+            .and_then(|text| environment_marker(text, "begin"))
+            .is_some_and(|(_, name)| is_prose_environment_name(name))
+    {
+        let begin_end = begin.end_byte();
+        let end_start = end.start_byte();
+        if begin_end <= end_start {
+            let mut cursor = skip_horizontal_and_line_whitespace(source, begin_end, end_start);
+            // A required argument belongs to the opening command, even when the
+            // grammar represents it as generic environment content.
+            if source.as_bytes().get(cursor) != Some(&b'{') {
+                let mut labels = String::new();
+                while let Some(label_end) = label_command_end(source, cursor)
+                    && label_end <= end_start
+                {
+                    labels.push_str(&source[cursor..label_end]);
+                    cursor = skip_horizontal_and_line_whitespace(source, label_end, end_start);
+                }
+
+                let body_end = cursor
+                    + source[cursor..end_start]
+                        .trim_end_matches([' ', '\t', '\r', '\n'])
+                        .len();
+                let mut replacement = labels;
+                replacement.push_str(line_ending);
+                let begin_range = begin_end..cursor;
+                if !options.indent_environments
+                    && let Some(last_newline) = source[begin_range.clone()].rfind('\n')
+                {
+                    replacement.push_str(&source[begin_end + last_newline + 1..cursor]);
+                }
+                if !skipped.overlaps(&begin_range) {
+                    edits.push(OwnedTextEdit {
+                        range: begin_range,
+                        replacement,
+                    });
+                }
+                if cursor < body_end {
+                    let end_range = body_end..end_start;
+                    if !skipped.overlaps(&end_range) {
+                        let mut replacement = line_ending.to_owned();
+                        if !options.indent_environments
+                            && let Some(last_newline) = source[end_range.clone()].rfind('\n')
+                        {
+                            replacement.push_str(&source[body_end + last_newline + 1..end_start]);
+                        }
+                        edits.push(OwnedTextEdit {
+                            range: end_range,
+                            replacement,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_generic_environment_edits(child, source, line_ending, options, skipped, edits);
+    }
+}
+
+fn is_prose_environment_name(name: &str) -> bool {
+    matches!(
+        name,
+        "abstract"
+            | "proof"
+            | "definition"
+            | "theorem"
+            | "lemma"
+            | "corollary"
+            | "proposition"
+            | "remark"
+            | "example"
+            | "claim"
+            | "conjecture"
+            | "exercise"
+            | "solution"
+            | "axiom"
+            | "assumption"
+    )
+}
+
+fn skip_horizontal_and_line_whitespace(source: &str, mut offset: usize, end: usize) -> usize {
+    while offset < end && matches!(source.as_bytes()[offset], b' ' | b'\t' | b'\r' | b'\n') {
+        offset += 1;
+    }
+    offset
 }
 
 fn display_delimiter_lengths(formula: &str) -> Option<(usize, usize)> {
@@ -1407,7 +1554,10 @@ fn is_alignment_environment_name(name: &str) -> bool {
 }
 
 fn rewrite_prose(source: &str, options: &WriterOptions) -> String {
-    if !options.sentence_per_line && !options.blank_lines_around_sections {
+    if !options.sentence_per_line
+        && !options.blank_lines_around_sections
+        && !options.collapse_prose_whitespace
+    {
         return source.to_owned();
     }
 
@@ -1417,8 +1567,11 @@ fn rewrite_prose(source: &str, options: &WriterOptions) -> String {
     let mut previous_blank = true;
     let mut previous_section = false;
     let mut raw_environment: Option<String> = None;
+    let mut structured_environments = Vec::new();
 
-    for (row, line) in SourceLines::new(source).enumerate() {
+    let lines = SourceLines::new(source).collect::<Vec<_>>();
+    let mut row = 0;
+    while let Some(line) = lines.get(row) {
         if skipped.contains_row(row) {
             output.push_str(line.content);
             output.push_str(line.ending);
@@ -1432,12 +1585,39 @@ fn rewrite_prose(source: &str, options: &WriterOptions) -> String {
             {
                 raw_environment = None;
             }
+            if raw_environment.is_none() {
+                update_structured_environments(line.content, &mut structured_environments);
+            }
+            row += 1;
             continue;
         }
         let blank = line.content.trim_matches([' ', '\t']).is_empty();
         let entering_raw = raw_environment_name(line.content, "begin");
         let raw_content = raw_environment.is_some() || entering_raw.is_some();
-        let section = !raw_content && is_section_line(line.content);
+        let section_end = (!raw_content)
+            .then(|| section_command_end(line.content))
+            .flatten();
+        let section = section_end.is_some();
+        let mut attached_label = None;
+        let mut consumed_row = row;
+        if let Some(end) = section_end
+            && line.content[end..].trim_matches([' ', '\t']).is_empty()
+        {
+            let mut next = row + 1;
+            while let Some(candidate) = lines.get(next)
+                && !skipped.contains_row(next)
+                && candidate.content.trim_matches([' ', '\t']).is_empty()
+            {
+                next += 1;
+            }
+            if let Some(candidate) = lines.get(next)
+                && !skipped.contains_row(next)
+                && let Some(label) = standalone_label(candidate.content)
+            {
+                attached_label = Some(label);
+                consumed_row = next;
+            }
+        }
         let inserted_ending = if line.ending.is_empty() {
             fallback_ending
         } else {
@@ -1457,26 +1637,57 @@ fn rewrite_prose(source: &str, options: &WriterOptions) -> String {
             }
         }
 
-        let boundaries = if options.sentence_per_line && !raw_content && is_prose_line(line.content)
+        let mut content = line.content;
+        let mut section_has_body = false;
+        if let Some(end) = section_end {
+            let body = line.content[end..].trim_start_matches([' ', '\t']);
+            if !body.is_empty() && !body.starts_with('%') {
+                output.push_str(line.content[..end].trim_end_matches([' ', '\t']));
+                output.push_str(inserted_ending);
+                if options.blank_lines_around_sections {
+                    output.push_str(inserted_ending);
+                }
+                content = body;
+                section_has_body = true;
+            }
+        }
+
+        let normalized_content = (options.collapse_prose_whitespace
+            && !raw_content
+            && structured_environments.is_empty()
+            && is_prose_line(content))
+        .then(|| collapse_prose_whitespace(content));
+        let content = normalized_content.as_deref().unwrap_or(content);
+
+        let boundaries = if options.sentence_per_line
+            && !raw_content
+            && structured_environments.is_empty()
+            && is_prose_line(content)
         {
-            sentence_boundaries(line.content)
+            sentence_boundaries(content)
         } else {
             Vec::new()
         };
+        let leading_len = content.len() - content.trim_start_matches([' ', '\t']).len();
+        let leading = &content[..leading_len];
         let mut start = 0;
         for boundary in boundaries {
-            output.push_str(line.content[start..boundary].trim_end_matches([' ', '\t']));
+            output.push_str(content[start..boundary].trim_end_matches([' ', '\t']));
             output.push_str(inserted_ending);
+            output.push_str(leading);
             start = boundary;
-            while line.content[start..].starts_with([' ', '\t']) {
+            while content[start..].starts_with([' ', '\t']) {
                 start += 1;
             }
         }
-        output.push_str(&line.content[start..]);
-        output.push_str(line.ending);
+        output.push_str(&content[start..]);
+        if let Some(label) = attached_label {
+            output.push_str(label);
+        }
+        output.push_str(lines[consumed_row].ending);
 
         previous_blank = blank;
-        previous_section = section;
+        previous_section = section && !section_has_body;
 
         if let Some(name) = entering_raw {
             raw_environment = Some(name.to_owned());
@@ -1486,39 +1697,128 @@ fn rewrite_prose(source: &str, options: &WriterOptions) -> String {
         {
             raw_environment = None;
         }
+        if !raw_content {
+            update_structured_environments(line.content, &mut structured_environments);
+        }
+        row = consumed_row + 1;
     }
 
     output
 }
 
-fn is_section_line(line: &str) -> bool {
+fn section_command_end(line: &str) -> Option<usize> {
     if line.starts_with([' ', '\t']) {
-        return false;
+        return None;
     }
-    matches!(
-        line.strip_prefix('\\')
-            .and_then(|rest| rest.split_once('{').map(|pair| pair.0)),
-        Some(
-            "part"
-                | "chapter"
-                | "section"
-                | "section*"
-                | "subsection"
-                | "subsection*"
-                | "subsubsection"
-                | "subsubsection*"
-                | "paragraph"
-                | "paragraph*"
-                | "subparagraph"
-                | "subparagraph*"
-        )
-    )
+    let command = line.strip_prefix('\\')?;
+    let name_len = command
+        .find(|character: char| !(character.is_ascii_alphabetic() || character == '*'))
+        .unwrap_or(command.len());
+    if !matches!(
+        &command[..name_len],
+        "part"
+            | "chapter"
+            | "section"
+            | "section*"
+            | "subsection"
+            | "subsection*"
+            | "subsubsection"
+            | "subsubsection*"
+            | "paragraph"
+            | "paragraph*"
+            | "subparagraph"
+            | "subparagraph*"
+    ) {
+        return None;
+    }
+
+    let bytes = line.as_bytes();
+    let mut offset = 1 + name_len;
+    while bytes
+        .get(offset)
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        offset += 1;
+    }
+    if bytes.get(offset) == Some(&b'[') {
+        offset = grouped_command_end(line, offset, b'[', b']')?;
+        while bytes
+            .get(offset)
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+        {
+            offset += 1;
+        }
+    }
+    if bytes.get(offset) != Some(&b'{') {
+        return None;
+    }
+    offset = grouped_command_end(line, offset, b'{', b'}')?;
+    loop {
+        let label_start = line.len() - line[offset..].trim_start_matches([' ', '\t']).len();
+        let Some(label_end) = label_command_end(line, label_start) else {
+            break;
+        };
+        offset = label_end;
+    }
+    Some(offset)
+}
+
+fn label_command_end(line: &str, start: usize) -> Option<usize> {
+    let command = line.get(start..)?;
+    command.strip_prefix("\\label{")?;
+    grouped_command_end(line, start + "\\label".len(), b'{', b'}')
+}
+
+fn standalone_label(line: &str) -> Option<&str> {
+    let content = line.trim_matches([' ', '\t']);
+    let mut offset = 0;
+    loop {
+        offset = label_command_end(content, offset)?;
+        offset = content.len() - content[offset..].trim_start_matches([' ', '\t']).len();
+        if offset == content.len() {
+            return Some(content);
+        }
+    }
+}
+
+fn grouped_command_end(line: &str, start: usize, open: u8, close: u8) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut depth = 0;
+    for (offset, byte) in bytes.iter().enumerate().skip(start) {
+        if is_escaped(bytes, offset) {
+            continue;
+        }
+        if *byte == open {
+            depth += 1;
+        } else if *byte == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(offset + 1);
+            }
+        }
+    }
+    None
 }
 
 fn is_prose_line(line: &str) -> bool {
-    !line.is_empty()
-        && !line.starts_with([' ', '\t', '\\', '%'])
-        && line.chars().any(char::is_alphabetic)
+    let content = line.trim_start_matches([' ', '\t']);
+    !content.is_empty()
+        && !content.starts_with(['\\', '%'])
+        && content.chars().any(char::is_alphabetic)
+}
+
+fn update_structured_environments(line: &str, environments: &mut Vec<String>) {
+    let trimmed = line.trim_start_matches([' ', '\t']);
+    if let Some((_, name)) = environment_marker(trimmed, "begin")
+        && (is_math_environment_name(name) || is_alignment_environment_name(name))
+    {
+        environments.push(name.to_owned());
+    }
+    if let Some((_, name)) = environment_marker(trimmed, "end")
+        && environments.last().is_some_and(|open| open == name)
+    {
+        environments.pop();
+    }
 }
 
 fn raw_environment_name<'line>(line: &'line str, marker: &str) -> Option<&'line str> {
@@ -1546,6 +1846,68 @@ fn raw_environment_name<'line>(line: &'line str, marker: &str) -> Option<&'line 
             | "sageblock"
     )
     .then_some(name)
+}
+
+fn collapse_prose_whitespace(line: &str) -> String {
+    if line.contains("\\verb") || line.contains("\\lstinline") || line.contains("\\mintinline") {
+        return line.to_owned();
+    }
+
+    let bytes = line.as_bytes();
+    let leading_len = line.len() - line.trim_start_matches([' ', '\t']).len();
+    let mut output = String::with_capacity(line.len());
+    output.push_str(&line[..leading_len]);
+    let mut offset = leading_len;
+    let mut in_math = false;
+    let mut brace_depth = 0usize;
+
+    while offset < bytes.len() {
+        if bytes[offset] == b'\\'
+            && !is_escaped(bytes, offset)
+            && offset + 1 < bytes.len()
+            && matches!(bytes[offset + 1], b'(' | b'[' | b')' | b']')
+        {
+            in_math = matches!(bytes[offset + 1], b'(' | b'[');
+            output.push_str(&line[offset..offset + 2]);
+            offset += 2;
+            continue;
+        }
+        if bytes[offset] == b'$' && !is_escaped(bytes, offset) {
+            let length = if bytes.get(offset + 1) == Some(&b'$') {
+                2
+            } else {
+                1
+            };
+            in_math = !in_math;
+            output.push_str(&line[offset..offset + length]);
+            offset += length;
+            continue;
+        }
+        if bytes[offset] == b'%' && !is_escaped(bytes, offset) && !in_math {
+            output.push_str(&line[offset..]);
+            break;
+        }
+        if !in_math && !is_escaped(bytes, offset) {
+            match bytes[offset] {
+                b'{' => brace_depth += 1,
+                b'}' => brace_depth = brace_depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        if !in_math && brace_depth == 0 && matches!(bytes[offset], b' ' | b'\t') {
+            while offset < bytes.len() && matches!(bytes[offset], b' ' | b'\t') {
+                offset += 1;
+            }
+            output.push(' ');
+            continue;
+        }
+
+        let character = line[offset..].chars().next().unwrap();
+        output.push(character);
+        offset += character.len_utf8();
+    }
+
+    output
 }
 
 fn sentence_boundaries(line: &str) -> Vec<usize> {
@@ -1608,7 +1970,9 @@ fn sentence_boundaries(line: &str) -> Vec<usize> {
         }
         if next > whitespace_start
             && next < bytes.len()
-            && line[next..].chars().next().is_some_and(char::is_uppercase)
+            && (line[next..].chars().next().is_some_and(char::is_uppercase)
+                || line[next..].starts_with('$')
+                || line[next..].starts_with("\\("))
         {
             boundaries.push(next);
             offset = next;
@@ -1828,7 +2192,8 @@ mod tests {
             "\\begin{enumerate}\n",
             "  prefix\n",
             "  \\item\n",
-            "    First item. More text.\n",
+            "    First item.\n",
+            "    More text.\n",
             "  \\item[Named]\n",
             "    Second item.\n",
             "\\end{enumerate}\n"
@@ -2131,11 +2496,204 @@ mod tests {
     }
 
     #[test]
+    fn moves_prose_after_a_section_heading_to_its_own_paragraph() {
+        let source = concat!(
+            "Before.\n",
+            "\\section{Heisenberg picture of CNOT gates} ",
+            "A two qubit unitary acts on the target. Another sentence.\n"
+        );
+        let expected = concat!(
+            "Before.\n",
+            "\n",
+            "\\section{Heisenberg picture of CNOT gates}\n",
+            "\n",
+            "A two qubit unitary acts on the target.\n",
+            "Another sentence.\n"
+        );
+
+        assert_eq!(write(source, &WriterOptions::default()), expected);
+        assert_eq!(write(expected, &WriterOptions::default()), expected);
+    }
+
+    #[test]
+    fn separates_optional_and_nested_section_titles_from_following_text() {
+        let source = "\\subsection[Short]{A \\textbf{long} title} Body. Next.\n";
+        let expected = "\\subsection[Short]{A \\textbf{long} title}\n\nBody.\nNext.\n";
+        assert_eq!(write(source, &WriterOptions::default()), expected);
+
+        let options = WriterOptions {
+            blank_lines_around_sections: false,
+            ..WriterOptions::default()
+        };
+        let without_blank = "\\subsection[Short]{A \\textbf{long} title}\nBody.\nNext.\n";
+        assert_eq!(write(source, &options), without_blank);
+    }
+
+    #[test]
+    fn keeps_trailing_section_comments_on_the_heading_line() {
+        let source = "\\section{Title} % keep this comment\nBody text.\n";
+        let expected = "\\section{Title} % keep this comment\n\nBody text.\n";
+        assert_eq!(write(source, &WriterOptions::default()), expected);
+    }
+
+    #[test]
+    fn keeps_a_section_label_on_the_heading_line() {
+        let source = "\\section{Introduction}\n\n\\label{sec:intro}\n\nBody text.\n";
+        let expected = "\\section{Introduction}\\label{sec:intro}\n\nBody text.\n";
+
+        assert_eq!(write(source, &WriterOptions::default()), expected);
+        assert_eq!(write(expected, &WriterOptions::default()), expected);
+    }
+
+    #[test]
+    fn keeps_an_inline_section_label_before_following_prose() {
+        let source = "\\section{Title}\\label{sec:title} Body. Next.\n";
+        let expected = "\\section{Title}\\label{sec:title}\n\nBody.\nNext.\n";
+
+        assert_eq!(write(source, &WriterOptions::default()), expected);
+    }
+
+    #[test]
+    fn does_not_move_a_section_label_out_of_a_skipped_region() {
+        let source = concat!(
+            "\\section{Title}\n",
+            "% latex-treefmt: off\n",
+            "\\label{sec:title}\n",
+            "% latex-treefmt: on\n",
+            "Body text.\n"
+        );
+        let output = write(source, &WriterOptions::default());
+
+        assert!(output.contains("\\section{Title}\n% latex-treefmt: off\n"));
+        assert!(output.contains("\\label{sec:title}\n% latex-treefmt: on\n"));
+    }
+
+    #[test]
+    fn wraps_indented_sentences_inside_prose_environments() {
+        let source = concat!(
+            "\\begin{proof}\n",
+            "  First sentence. Second sentence with $A(F)$. Third sentence.\n",
+            "\\end{proof}\n",
+            "\\begin{abstract}\n",
+            "  Another sentence. Final sentence.\n",
+            "\\end{abstract}\n"
+        );
+        let expected = concat!(
+            "\\begin{proof}\n",
+            "  First sentence.\n",
+            "  Second sentence with $A(F)$.\n",
+            "  Third sentence.\n",
+            "\\end{proof}\n",
+            "\\begin{abstract}\n",
+            "  Another sentence.\n",
+            "  Final sentence.\n",
+            "\\end{abstract}\n"
+        );
+
+        assert_eq!(write(source, &WriterOptions::default()), expected);
+        assert_eq!(write(expected, &WriterOptions::default()), expected);
+    }
+
+    #[test]
+    fn keeps_prose_environment_bodies_adjacent_to_their_boundaries() {
+        let source = concat!(
+            "\\begin{definition}[Hypergraph product code] ",
+            "First sentence. Second sentence.\n",
+            "\n",
+            "\\end{definition}\n"
+        );
+        let expected = concat!(
+            "\\begin{definition}[Hypergraph product code]\n",
+            "  First sentence.\n",
+            "  Second sentence.\n",
+            "\\end{definition}\n"
+        );
+
+        assert_eq!(write(source, &WriterOptions::default()), expected);
+        assert_eq!(write(expected, &WriterOptions::default()), expected);
+    }
+
+    #[test]
+    fn keeps_an_environment_label_with_its_opening_command() {
+        let source = concat!(
+            "\\begin{theorem}[Named]\n",
+            "\n",
+            "  \\label{thm:named}\n",
+            "\n",
+            "Statement. More text. \\end{theorem}\n"
+        );
+        let expected = concat!(
+            "\\begin{theorem}[Named]\\label{thm:named}\n",
+            "  Statement.\n",
+            "  More text.\n",
+            "\\end{theorem}\n"
+        );
+
+        assert_eq!(write(source, &WriterOptions::default()), expected);
+        assert_eq!(write(expected, &WriterOptions::default()), expected);
+    }
+
+    #[test]
+    fn wraps_a_sentence_starting_with_inline_math() {
+        let source = concat!(
+            "For $x\\in\\F_2^n$ let $\\wt{x}$ denote its Hamming weight.  ",
+            "$\\cnot_{ij}$ denotes a controlled-NOT operation.\n"
+        );
+        let expected = concat!(
+            "For $x\\in\\F_2^n$ let $\\wt{x}$ denote its Hamming weight.\n",
+            "$\\cnot_{ij}$ denotes a controlled-NOT operation.\n"
+        );
+
+        assert_eq!(write(source, &WriterOptions::default()), expected);
+        assert_eq!(write(expected, &WriterOptions::default()), expected);
+    }
+
+    #[test]
+    fn wraps_a_sentence_starting_with_parenthesized_math() {
+        let source = "First sentence. \\(x\\) starts the next one.\n";
+        let options = WriterOptions {
+            inline_math_delimiters: InlineMathDelimiters::Preserve,
+            ..WriterOptions::default()
+        };
+        let expected = "First sentence.\n\\(x\\) starts the next one.\n";
+
+        assert_eq!(write(source, &options), expected);
+    }
+
+    #[test]
+    fn preserves_existing_prose_indentation_when_indent_is_disabled() {
+        let source = "\\begin{proof}\n\tFirst sentence. Second sentence.\n\n\t\\end{proof}\n";
+        let options = WriterOptions {
+            indent_environments: false,
+            ..WriterOptions::default()
+        };
+        let expected = "\\begin{proof}\n\tFirst sentence.\n\tSecond sentence.\n\t\\end{proof}\n";
+
+        assert_eq!(write(source, &options), expected);
+    }
+
+    #[test]
+    fn does_not_split_sentence_like_text_in_structured_environments() {
+        let source = concat!(
+            "\\begin{tabular}{l}\n",
+            "First. Second. \\\\\n",
+            "\\end{tabular}\n",
+            "\\begin{equation}\n",
+            "A. B\n",
+            "\\end{equation}\n"
+        );
+        let output = write(source, &WriterOptions::default());
+
+        assert!(output.contains("First. Second."));
+        assert!(output.contains("A.B"));
+    }
+
+    #[test]
     fn sentence_wrapping_avoids_comments_groups_and_verbatim() {
         let source = concat!(
             "Text % comment. Next\n",
             "\\begin{verbatim}\n",
-            "Sentence. Next.\n",
+            "  Sentence. Next.\n",
             "\\section{literal}\n",
             "\\end{verbatim}\n",
             "A \\textit{Not. Split} ending. Next sentence.\n"
@@ -2143,7 +2701,7 @@ mod tests {
         let expected = concat!(
             "Text % comment. Next\n",
             "\\begin{verbatim}\n",
-            "Sentence. Next.\n",
+            "  Sentence. Next.\n",
             "\\section{literal}\n",
             "\\end{verbatim}\n",
             "A \\textit{Not. Split} ending.\n",
@@ -2151,6 +2709,36 @@ mod tests {
         );
 
         assert_eq!(write(source, &WriterOptions::default()), expected);
+    }
+
+    #[test]
+    fn collapses_repeated_spaces_in_prose_after_inline_math() {
+        let source = concat!(
+            "\\begin{theorem}\n",
+            "  $\\ker(H_1^T)$     and take $e_1^T$ to satisfy the condition.\n",
+            "\\end{theorem}\n"
+        );
+        let expected = concat!(
+            "\\begin{theorem}\n",
+            "  $\\ker(H_1^T)$ and take $e_1^T$ to satisfy the condition.\n",
+            "\\end{theorem}\n"
+        );
+
+        assert_eq!(write(source, &WriterOptions::default()), expected);
+        assert_eq!(write(expected, &WriterOptions::default()), expected);
+    }
+
+    #[test]
+    fn preserves_protected_spaces_while_collapsing_prose() {
+        let source = "Before  $x$    and \\textbf{two  words}  after. % comment  kept\n";
+        let expected = "Before $x$ and \\textbf{two  words} after. % comment  kept\n";
+        assert_eq!(write(source, &WriterOptions::default()), expected);
+
+        let options = WriterOptions {
+            collapse_prose_whitespace: false,
+            ..WriterOptions::default()
+        };
+        assert_eq!(write(source, &options), source);
     }
 
     #[test]
