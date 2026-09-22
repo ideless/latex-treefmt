@@ -23,8 +23,10 @@ nodes so formatting never silently drops input.
 
 The current writer formats:
 
-- environment indentation, with `document` contents kept at the outer level by
-  default;
+- recursive environment indentation, with `document` contents kept at the
+  outer level by default;
+- canonical environment boundaries, parameters, and labels, with body content
+  directly between the opening and closing lines;
 - aligned `&` column separators and `\\` row terminators in table and alignment
   environments;
 - compact math spacing while retaining lexically required control-word spaces;
@@ -76,7 +78,23 @@ cargo run -- --preserve document.tex
 
 Run `cargo run -- --help` for all writer options. Formatting recovered trees is
 allowed, but the CLI emits a warning when Tree-sitter reports parse errors.
-Each structural rule has a corresponding opt-out flag.
+Most structural rules have a corresponding opt-out flag.
+
+Non-verbatim environments use this layout:
+
+```tex
+\begin{foo}[optional]{required}\label{env:foo}
+  content
+\end{foo}
+```
+
+The opening and closing commands occupy their own lines. Leading parameter
+groups and labels are attached to the opening command without spaces. The body
+has one additional indentation level and is formatted recursively, with no
+blank line immediately inside either boundary. Verbatim-like environment
+contents remain byte-for-byte protected. The `document` environment is special:
+its body stays at the outer indentation level by default, and blank lines just
+inside its boundaries are retained.
 
 Choose command-style delimiters independently for inline and display math:
 
@@ -97,8 +115,8 @@ cargo run -- --display-math-layout block document.tex
 
 The other display-layout modes are `adaptive` (the default) and `preserve`.
 
-Pass `--indent-document` to include the `document` environment in normal
-environment indentation.
+Pass `--indent-document` to include `document` contents in recursive environment
+indentation.
 
 Pass `--no-align-environments` to retain the original placement of `&` column
 separators and `\\` row terminators.

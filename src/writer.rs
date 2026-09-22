@@ -187,17 +187,14 @@ impl<'source, 'options> LatexWriter<'source, 'options> {
         let display_formatted =
             apply_display_math_layout(&item_formatted, &item_tree, self.options)?;
         let display_tree = parser.parse(&display_formatted)?;
-        let environment_formatted = normalize_generic_environment_boundaries(
-            &display_formatted,
-            &display_tree,
-            self.options,
-        )?;
+        let environment_formatted =
+            normalize_environment_boundaries(&display_formatted, &display_tree, self.options)?;
         let environment_tree = parser.parse(&environment_formatted)?;
         let metadata =
             TreeMetadata::from_tree(&environment_tree, &environment_formatted, self.options);
-        let aligned = align_environment_rows(&environment_formatted, self.options, &metadata);
-        let line_formatted = rewrite_lines(&aligned, self.options, &metadata);
-        let block_formatted = separate_math_environment_boundaries(&line_formatted, self.options);
+        let line_formatted = rewrite_lines(&environment_formatted, self.options, &metadata);
+        let aligned = align_environment_rows(&line_formatted, self.options, &metadata);
+        let block_formatted = separate_math_environment_boundaries(&aligned, self.options);
         Ok(rewrite_prose(&block_formatted, self.options))
     }
 
@@ -906,14 +903,14 @@ fn collect_display_formulas(node: Node<'_>, formulas: &mut Vec<DisplayFormula>) 
     }
 }
 
-fn normalize_generic_environment_boundaries(
+fn normalize_environment_boundaries(
     source: &str,
     tree: &Tree,
     options: &WriterOptions,
 ) -> Result<String, WriteError> {
     let skipped = SkipRegions::new(source);
     let mut edits = Vec::new();
-    collect_generic_environment_edits(
+    collect_environment_edits(
         tree.root_node(),
         source,
         detected_line_ending(source),
@@ -936,7 +933,7 @@ fn normalize_generic_environment_boundaries(
     Ok(output)
 }
 
-fn collect_generic_environment_edits(
+fn collect_environment_edits(
     node: Node<'_>,
     source: &str,
     line_ending: &str,
@@ -944,65 +941,140 @@ fn collect_generic_environment_edits(
     skipped: &SkipRegions,
     edits: &mut Vec<OwnedTextEdit>,
 ) {
-    if node.kind() == "generic_environment"
+    if is_environment(node.kind())
+        && !is_raw_environment(node.kind())
         && let (Some(begin), Some(end)) = (
             node.child_by_field_name("begin"),
             node.child_by_field_name("end"),
         )
         && !skipped.overlaps(&begin.byte_range())
         && !skipped.overlaps(&end.byte_range())
-        && source
-            .get(begin.byte_range())
-            .and_then(|text| environment_marker(text, "begin"))
-            .is_some_and(|(_, name)| is_prose_environment_name(name))
     {
+        let begin_start = begin.start_byte();
         let begin_end = begin.end_byte();
         let end_start = end.start_byte();
-        if begin_end <= end_start {
+        let end_end = end.end_byte();
+        let is_document = source
+            .get(begin.byte_range())
+            .and_then(|text| environment_marker(text, "begin"))
+            .is_some_and(|(_, name)| name == "document");
+        if let Some(options_node) = begin.child_by_field_name("options") {
+            let options_start = options_node.start_byte();
+            let name_end = begin
+                .child_by_field_name("name")
+                .map_or(options_start, |name| name.end_byte());
+            let range = name_end..options_start;
+            if source
+                .get(range.clone())
+                .is_some_and(|text| !text.is_empty() && text.chars().all(char::is_whitespace))
+            {
+                edits.push(OwnedTextEdit {
+                    range,
+                    replacement: String::new(),
+                });
+            }
+        }
+        let begin_line_start = source[..begin_start]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        if !source[begin_line_start..begin_start]
+            .trim_matches([' ', '\t', '\r'])
+            .is_empty()
+            && !starts_parent_environment_body(node, source)
+        {
+            edits.push(OwnedTextEdit {
+                range: begin_start..begin_start,
+                replacement: line_ending.to_owned(),
+            });
+        }
+
+        let end_line_end = source[end_end..]
+            .find('\n')
+            .map_or(source.len(), |newline| end_end + newline);
+        if !source[end_end..end_line_end]
+            .trim_matches([' ', '\t', '\r'])
+            .is_empty()
+            && !finishes_parent_environment_body(node, source)
+        {
+            edits.push(OwnedTextEdit {
+                range: end_end..end_end,
+                replacement: line_ending.to_owned(),
+            });
+        }
+
+        if begin_end <= end_start && is_document {
+            preserve_document_boundary_whitespace(
+                source,
+                begin_end,
+                end_start,
+                line_ending,
+                skipped,
+                edits,
+            );
+        } else if begin_end <= end_start {
             let mut cursor = skip_horizontal_and_line_whitespace(source, begin_end, end_start);
-            // A required argument belongs to the opening command, even when the
-            // grammar represents it as generic environment content.
-            if source.as_bytes().get(cursor) != Some(&b'{') {
-                let mut labels = String::new();
-                while let Some(label_end) = label_command_end(source, cursor)
+            let mut parameters = String::new();
+            let mut labels = String::new();
+            loop {
+                let group_end = match source.as_bytes().get(cursor) {
+                    Some(b'{') => grouped_command_end(source, cursor, b'{', b'}'),
+                    Some(b'[') => grouped_command_end(source, cursor, b'[', b']'),
+                    _ => None,
+                };
+                if let Some(group_end) = group_end.filter(|end| *end <= end_start) {
+                    parameters.push_str(&source[cursor..group_end]);
+                    cursor = skip_horizontal_and_line_whitespace(source, group_end, end_start);
+                    continue;
+                }
+                if let Some(label_end) = label_command_end(source, cursor)
                     && label_end <= end_start
                 {
                     labels.push_str(&source[cursor..label_end]);
                     cursor = skip_horizontal_and_line_whitespace(source, label_end, end_start);
+                    continue;
                 }
+                break;
+            }
 
-                let body_end = cursor
-                    + source[cursor..end_start]
-                        .trim_end_matches([' ', '\t', '\r', '\n'])
-                        .len();
-                let mut replacement = labels;
-                replacement.push_str(line_ending);
-                let begin_range = begin_end..cursor;
-                if !options.indent_environments
-                    && let Some(last_newline) = source[begin_range.clone()].rfind('\n')
-                {
-                    replacement.push_str(&source[begin_end + last_newline + 1..cursor]);
+            let body_end = cursor
+                + source[cursor..end_start]
+                    .trim_end_matches([' ', '\t', '\r', '\n'])
+                    .len();
+            let mut replacement = parameters;
+            replacement.push_str(&labels);
+            replacement.push_str(line_ending);
+            let begin_range = begin_end..cursor;
+            if !options.indent_environments
+                && let Some(last_newline) = source[begin_range.clone()].rfind('\n')
+            {
+                replacement.push_str(&source[begin_end + last_newline + 1..cursor]);
+            }
+
+            if cursor >= body_end {
+                let range = begin_end..end_start;
+                if !skipped.overlaps(&range) {
+                    edits.push(OwnedTextEdit { range, replacement });
                 }
+            } else {
                 if !skipped.overlaps(&begin_range) {
                     edits.push(OwnedTextEdit {
                         range: begin_range,
                         replacement,
                     });
                 }
-                if cursor < body_end {
-                    let end_range = body_end..end_start;
-                    if !skipped.overlaps(&end_range) {
-                        let mut replacement = line_ending.to_owned();
-                        if !options.indent_environments
-                            && let Some(last_newline) = source[end_range.clone()].rfind('\n')
-                        {
-                            replacement.push_str(&source[body_end + last_newline + 1..end_start]);
-                        }
-                        edits.push(OwnedTextEdit {
-                            range: end_range,
-                            replacement,
-                        });
+
+                let end_range = body_end..end_start;
+                if !skipped.overlaps(&end_range) {
+                    let mut replacement = line_ending.to_owned();
+                    if !options.indent_environments
+                        && let Some(last_newline) = source[end_range.clone()].rfind('\n')
+                    {
+                        replacement.push_str(&source[body_end + last_newline + 1..end_start]);
                     }
+                    edits.push(OwnedTextEdit {
+                        range: end_range,
+                        replacement,
+                    });
                 }
             }
         }
@@ -1010,29 +1082,69 @@ fn collect_generic_environment_edits(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_generic_environment_edits(child, source, line_ending, options, skipped, edits);
+        collect_environment_edits(child, source, line_ending, options, skipped, edits);
     }
 }
 
-fn is_prose_environment_name(name: &str) -> bool {
-    matches!(
-        name,
-        "abstract"
-            | "proof"
-            | "definition"
-            | "theorem"
-            | "lemma"
-            | "corollary"
-            | "proposition"
-            | "remark"
-            | "example"
-            | "claim"
-            | "conjecture"
-            | "exercise"
-            | "solution"
-            | "axiom"
-            | "assumption"
-    )
+fn preserve_document_boundary_whitespace(
+    source: &str,
+    begin_end: usize,
+    end_start: usize,
+    line_ending: &str,
+    skipped: &SkipRegions,
+    edits: &mut Vec<OwnedTextEdit>,
+) {
+    let content_start = source[begin_end..end_start]
+        .find(|character: char| !matches!(character, ' ' | '\t' | '\r' | '\n'))
+        .map_or(end_start, |offset| begin_end + offset);
+    let opening_whitespace = begin_end..content_start;
+    if !source[opening_whitespace.clone()].contains('\n') && !skipped.overlaps(&opening_whitespace)
+    {
+        edits.push(OwnedTextEdit {
+            range: opening_whitespace,
+            replacement: line_ending.to_owned(),
+        });
+    }
+
+    if content_start == end_start {
+        return;
+    }
+    let content_end = content_start
+        + source[content_start..end_start]
+            .trim_end_matches([' ', '\t', '\r', '\n'])
+            .len();
+    let closing_whitespace = content_end..end_start;
+    if !source[closing_whitespace.clone()].contains('\n') && !skipped.overlaps(&closing_whitespace)
+    {
+        edits.push(OwnedTextEdit {
+            range: closing_whitespace,
+            replacement: line_ending.to_owned(),
+        });
+    }
+}
+
+fn starts_parent_environment_body(node: Node<'_>, source: &str) -> bool {
+    let Some(parent) = node.parent().filter(|parent| is_environment(parent.kind())) else {
+        return false;
+    };
+    let Some(begin) = parent.child_by_field_name("begin") else {
+        return false;
+    };
+    source[begin.end_byte()..node.start_byte()]
+        .trim_matches([' ', '\t', '\r', '\n'])
+        .is_empty()
+}
+
+fn finishes_parent_environment_body(node: Node<'_>, source: &str) -> bool {
+    let Some(parent) = node.parent().filter(|parent| is_environment(parent.kind())) else {
+        return false;
+    };
+    let Some(end) = parent.child_by_field_name("end") else {
+        return false;
+    };
+    source[node.end_byte()..end.start_byte()]
+        .trim_matches([' ', '\t', '\r', '\n'])
+        .is_empty()
 }
 
 fn skip_horizontal_and_line_whitespace(source: &str, mut offset: usize, end: usize) -> usize {
@@ -2173,7 +2285,6 @@ mod tests {
             "\\begin{itemize}\n",
             "  \\item\n",
             "    one\n",
-            "\n",
             "\\end{itemize}\n",
             "\\end{document}\n"
         );
@@ -2232,6 +2343,41 @@ mod tests {
     }
 
     #[test]
+    fn allows_blank_lines_inside_document_boundaries() {
+        let source = concat!(
+            "\\begin{document}\n",
+            "\n",
+            " text   \n",
+            "\n",
+            "\\end{document}\n"
+        );
+        let expected = concat!(
+            "\\begin{document}\n",
+            "\n",
+            "text\n",
+            "\n",
+            "\\end{document}\n"
+        );
+
+        assert_eq!(write(source, &WriterOptions::default()), expected);
+        assert_eq!(write(expected, &WriterOptions::default()), expected);
+    }
+
+    #[test]
+    fn puts_inline_document_boundaries_on_their_own_lines() {
+        let source = "Before \\begin{document}Body text.\\end{document} After\n";
+        let expected = concat!(
+            "Before\n",
+            "\\begin{document}\n",
+            "Body text.\n",
+            "\\end{document}\n",
+            "After\n"
+        );
+
+        assert_eq!(write(source, &WriterOptions::default()), expected);
+    }
+
+    #[test]
     fn aligns_columns_and_row_terminators_in_structured_environments() {
         let source = concat!(
             "\\begin{align*}\n",
@@ -2259,6 +2405,27 @@ mod tests {
         );
 
         assert_eq!(write(source, &WriterOptions::default()), expected);
+    }
+
+    #[test]
+    fn preserves_alignment_padding_before_leading_empty_cells() {
+        let source = concat!(
+            "      \\begin{array}{ccc}\n",
+            "        I& &A\\\\\n",
+            "         &I&B\\\\\n",
+            "         & &C\n",
+            "      \\end{array}\n"
+        );
+        let expected = concat!(
+            "\\begin{array}{ccc}\n",
+            "  I &   & A \\\\\n",
+            "    & I & B \\\\\n",
+            "    &   & C\n",
+            "\\end{array}\n"
+        );
+
+        assert_eq!(write(source, &WriterOptions::default()), expected);
+        assert_eq!(write(expected, &WriterOptions::default()), expected);
     }
 
     #[test]
@@ -2631,6 +2798,44 @@ mod tests {
 
         assert_eq!(write(source, &WriterOptions::default()), expected);
         assert_eq!(write(expected, &WriterOptions::default()), expected);
+    }
+
+    #[test]
+    fn canonicalizes_environment_headers_boundaries_and_nested_content() {
+        let source = concat!(
+            "Before \\begin{foo} [optional]\n",
+            "  \\label{env:foo} {required}\n",
+            "\n",
+            "  First sentence. Second sentence. \\begin{bar} inner \\end{bar}\n",
+            "\n",
+            "\\end{foo} After\n"
+        );
+        let expected = concat!(
+            "Before\n",
+            "\\begin{foo}[optional]{required}\\label{env:foo}\n",
+            "  First sentence.\n",
+            "  Second sentence.\n",
+            "  \\begin{bar}\n",
+            "    inner\n",
+            "  \\end{bar}\n",
+            "\\end{foo}\n",
+            "After\n"
+        );
+
+        assert_eq!(write(source, &WriterOptions::default()), expected);
+        assert_eq!(write(expected, &WriterOptions::default()), expected);
+    }
+
+    #[test]
+    fn preserves_raw_environment_contents_during_environment_normalization() {
+        let source = concat!(
+            "\\begin{verbatim}\n",
+            "\\begin{foo} inline \\end{foo}\n",
+            "\n",
+            "\\end{verbatim}\n"
+        );
+
+        assert_eq!(write(source, &WriterOptions::default()), source);
     }
 
     #[test]
